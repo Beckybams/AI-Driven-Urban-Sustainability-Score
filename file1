@@ -1,0 +1,264 @@
+"""
+AI-Driven-Urban-Sustainability-Score
+Single-file Python project that:
+- Generates synthetic urban sustainability data
+- Computes a synthetic 'Sustainability Score' (0-100) as target
+- Trains a model to predict the score
+- Evaluates model performance
+- Exports synthetic dataset to Excel
+- Exposes a small predict function for new city profiles
+
+Usage:
+    python AI-Driven-Urban-Sustainability-Score.py --n 1000 --out dataset.xlsx --model model.joblib
+
+Dependencies (pip install):
+    pandas numpy scikit-learn joblib openpyxl
+
+"""
+
+import argparse
+import json
+import math
+import os
+from typing import Dict
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+def generate_synthetic_data(n_samples: int = 1000, random_state: int = 42) -> pd.DataFrame:
+    """Generate synthetic urban indicators and a target 'sustainability_score' (0-100).
+
+    Features generated (typical ranges used):
+      - air_quality_index (AQI): 10 - 200 (lower is better)
+      - green_space_per_capita (m2/person): 1 - 120 (higher better)
+      - public_transit_access (0-1): fraction of population within 500m of transit
+      - energy_consumption_per_capita (kWh/year): 1000 - 10000 (lower better)
+      - waste_recycling_rate (%): 0 - 90 (higher better)
+      - water_usage_per_capita (liters/day): 50 - 500 (lower better)
+      - population_density (people/km2): 500 - 20000 (moderate optimal)
+      - co2_emissions_per_capita (tCO2/year): 0.5 - 20 (lower better)
+      - walkability_score (0-100): 0 - 100 (higher better)
+      - gdp_per_capita (USD): 1000 - 90000 (can influence capability)
+
+    The target is a weighted normalized combination plus noise to simulate real-world messiness.
+    """
+    rng = np.random.RandomState(random_state)
+
+    # sample raw signals
+    aqi = rng.uniform(10, 200, size=n_samples)
+    green_space = rng.exponential(scale=20, size=n_samples) + rng.uniform(0, 5, n_samples)
+    green_space = np.clip(green_space, 0, 120)
+    public_transit = rng.beta(a=2, b=5, size=n_samples)  # skewed toward lower
+    energy = rng.uniform(1000, 10000, size=n_samples)
+    recycling = rng.beta(a=3, b=2, size=n_samples) * 100
+    water = rng.uniform(50, 500, size=n_samples)
+    pop_density = rng.lognormal(mean=7.0, sigma=1.0, size=n_samples)  # wide range
+    pop_density = np.clip(pop_density, 500, 20000)
+    co2 = rng.uniform(0.5, 20, size=n_samples)
+    walkability = rng.normal(loc=55, scale=20, size=n_samples)
+    walkability = np.clip(walkability, 0, 100)
+    gdp = rng.lognormal(mean=10.0, sigma=1.2, size=n_samples)
+    gdp = np.clip(gdp, 1000, 90000)
+
+    # normalize features to 0-1 for scoring
+    def norm(x):
+        return (x - x.min()) / (x.max() - x.min() + 1e-9)
+
+    aqi_n = 1 - norm(aqi)  # lower AQI -> better
+    green_n = norm(green_space)
+    transit_n = public_transit
+    energy_n = 1 - norm(energy)
+    recycling_n = norm(recycling)
+    water_n = 1 - norm(water)
+    # For population density, assume middle range is optimal: use a gaussian utility centered at median
+    pd_median = np.median(pop_density)
+    pd_std = np.std(pop_density) if np.std(pop_density) > 0 else 1.0
+    pop_density_n = np.exp(-0.5 * ((pop_density - pd_median) / (pd_std * 0.8)) ** 2)
+    pop_density_n = (pop_density_n - pop_density_n.min()) / (pop_density_n.max() - pop_density_n.min() + 1e-9)
+    co2_n = 1 - norm(co2)
+    walk_n = norm(walkability)
+    gdp_n = norm(gdp)
+
+    # weights (these can be adjusted for different fairness/priority scenarios)
+    weights = {
+        'aqi': 0.12,
+        'green': 0.12,
+        'transit': 0.10,
+        'energy': 0.12,
+        'recycling': 0.10,
+        'water': 0.08,
+        'pop_density': 0.06,
+        'co2': 0.12,
+        'walk': 0.10,
+        'gdp': 0.08,
+    }
+
+    # compute synthetic score in 0-100 with a bit of nonlinearity and noise
+    raw_score = (
+        weights['aqi'] * aqi_n +
+        weights['green'] * green_n +
+        weights['transit'] * transit_n +
+        weights['energy'] * energy_n +
+        weights['recycling'] * recycling_n +
+        weights['water'] * water_n +
+        weights['pop_density'] * pop_density_n +
+        weights['co2'] * co2_n +
+        weights['walk'] * walk_n +
+        weights['gdp'] * gdp_n
+    )
+
+    # introduce mild nonlinear interactions
+    interaction = 0.05 * (green_n * walk_n) + 0.04 * (transit_n * (1 - aqi_n))
+    raw_score = raw_score + interaction
+
+    # scale to 0-100 and add noise
+    score = 100 * (raw_score - raw_score.min()) / (raw_score.max() - raw_score.min() + 1e-9)
+    noise = rng.normal(scale=4.0, size=n_samples)
+    score = np.clip(score + noise, 0, 100)
+
+    df = pd.DataFrame({
+        'air_quality_index': aqi,
+        'green_space_per_capita': green_space,
+        'public_transit_access': public_transit,
+        'energy_consumption_per_capita': energy,
+        'waste_recycling_rate': recycling,
+        'water_usage_per_capita': water,
+        'population_density': pop_density,
+        'co2_emissions_per_capita': co2,
+        'walkability_score': walkability,
+        'gdp_per_capita': gdp,
+        'sustainability_score': score,
+    })
+
+    # add a few metadata columns to make the synthetic dataset feel realistic
+    city_names = [f"City_{i+1:04d}" for i in range(n_samples)]
+    df.insert(0, 'city_name', city_names)
+    df['region'] = rng.choice(['North', 'South', 'East', 'West', 'Central'], size=n_samples)
+
+    return df
+
+
+def train_model(df: pd.DataFrame, target_col: str = 'sustainability_score') -> Dict:
+    """Train a regression model to predict sustainability score.
+
+    Returns:
+      - pipeline (with scaler + model),
+      - metrics dict,
+      - X_test DataFrame with predictions appended.
+    """
+    features = [c for c in df.columns if c not in ['city_name', 'region', target_col]]
+    X = df[features]
+    y = df[target_col]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('model', RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1))
+    ])
+
+    pipeline.fit(X_train, y_train)
+
+    preds = pipeline.predict(X_test)
+
+    metrics = {
+        'mae': float(mean_absolute_error(y_test, preds)),
+        'rmse': float(math.sqrt(mean_squared_error(y_test, preds))),
+        'r2': float(r2_score(y_test, preds)),
+    }
+
+    X_test_out = X_test.copy()
+    X_test_out['actual'] = y_test.values
+    X_test_out['predicted'] = preds
+
+    return {
+        'pipeline': pipeline,
+        'metrics': metrics,
+        'X_test_out': X_test_out,
+        'features': features,
+    }
+
+
+def export_to_excel(df: pd.DataFrame, path: str = 'urban_sustainability_dataset.xlsx') -> None:
+    """Export dataframe to Excel (uses openpyxl under the hood)."""
+    df.to_excel(path, index=False)
+
+
+def save_model(pipeline, path: str = 'model.joblib') -> None:
+    joblib.dump(pipeline, path)
+
+
+def load_model(path: str):
+    return joblib.load(path)
+
+
+def predict_city(pipeline, city_profile: Dict) -> float:
+    """Given a fitted pipeline and a city profile dict (feature->value), return predicted score (float).
+
+    city_profile must contain the same numeric features generated by generate_synthetic_data.
+    Example keys: 'air_quality_index', 'green_space_per_capita', 'public_transit_access', ...
+    """
+    # required feature order must match training; pipeline expects a 2D array
+    features = [
+        'air_quality_index', 'green_space_per_capita', 'public_transit_access',
+        'energy_consumption_per_capita', 'waste_recycling_rate', 'water_usage_per_capita',
+        'population_density', 'co2_emissions_per_capita', 'walkability_score', 'gdp_per_capita'
+    ]
+    X = pd.DataFrame([ [city_profile.get(f, np.nan) for f in features] ], columns=features)
+    if X.isnull().any(axis=None):
+        missing = X.columns[X.isnull().any()].tolist()
+        raise ValueError(f"Missing required feature(s): {missing}")
+    pred = pipeline.predict(X)[0]
+    return float(pred)
+
+
+def main(args):
+    print("Generating synthetic dataset...")
+    df = generate_synthetic_data(n_samples=args.n, random_state=42)
+
+    print(f"Exporting dataset to {args.out}...")
+    export_to_excel(df, args.out)
+
+    print("Training model...")
+    res = train_model(df)
+    pipeline = res['pipeline']
+    metrics = res['metrics']
+
+    print("Metrics on held-out test set:")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    model_path = args.model
+    print(f"Saving model to {model_path}...")
+    save_model(pipeline, model_path)
+
+    # show a tiny sample of predictions
+    sample = res['X_test_out'].sample(n=min(5, len(res['X_test_out'])), random_state=1)
+    print("Sample predictions (actual vs predicted):")
+    print(sample[['actual', 'predicted']])
+
+    # if requested, save a CSV of predictions appended
+    if args.pred_out:
+        pred_df = res['X_test_out']
+        pred_path = args.pred_out
+        pred_df.to_csv(pred_path, index=False)
+        print(f"Saved test predictions to {pred_path}")
+
+    print("Done.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='AI-Driven-Urban-Sustainability-Score (synthetic)')
+    parser.add_argument('--n', type=int, default=1000, help='Number of synthetic samples to generate')
+    parser.add_argument('--out', type=str, default='urban_sustainability_dataset.xlsx', help='Excel output file for dataset')
+    parser.add_argument('--model', type=str, default='urban_sustainability_model.joblib', help='Path to save trained model')
+    parser.add_argument('--pred-out', type=str, default=None, help='Optional CSV file to save test set predictions')
+    parsed = parser.parse_args()
+    main(parsed)
